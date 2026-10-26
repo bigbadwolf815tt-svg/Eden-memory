@@ -32,3 +32,4 @@ EDEN_ACCEPTANCE_COMPLETE.txt
 .DS_Store
 .idea/
 .vscode/
+*.bak-*
