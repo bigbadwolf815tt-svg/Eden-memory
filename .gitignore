@@ -1,0 +1,34 @@
+# Python-generated files
+__pycache__/
+*.py[cod]
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Local memory data and backups
+data/
+backups/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.sqlite-*
+
+# Local logs and generated reports
+*.log
+acceptance-report.json
+final-verification-tests.log
+EDEN_ACCEPTANCE_COMPLETE.txt
+
+# Local secrets and environment settings
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.DS_Store
+.idea/
+.vscode/

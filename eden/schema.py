@@ -1,0 +1,226 @@
+"""SQLite schema and initialization for Eden."""
+
+from __future__ import annotations
+
+import sqlite3
+
+SCHEMA_VERSION = 4
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS memories (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    content TEXT NOT NULL,
+    memory_type TEXT NOT NULL DEFAULT 'fact',
+    category TEXT NOT NULL DEFAULT 'general',
+    source TEXT NOT NULL DEFAULT 'user',
+    importance INTEGER NOT NULL DEFAULT 3
+        CHECK (importance BETWEEN 1 AND 5),
+    confidence REAL NOT NULL DEFAULT 1.0
+        CHECK (confidence BETWEEN 0.0 AND 1.0),
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    last_accessed_at TEXT,
+    access_count INTEGER NOT NULL DEFAULT 0,
+    archived INTEGER NOT NULL DEFAULT 0 CHECK (archived IN (0, 1)),
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_memories_category ON memories(category);
+CREATE INDEX IF NOT EXISTS idx_memories_created_at ON memories(created_at);
+CREATE INDEX IF NOT EXISTS idx_memories_importance ON memories(importance);
+CREATE INDEX IF NOT EXISTS idx_memories_archived ON memories(archived);
+
+CREATE TABLE IF NOT EXISTS memory_links (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_memory_id INTEGER NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relationship TEXT NOT NULL DEFAULT 'related',
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    UNIQUE(source_memory_id, target_memory_id, relationship),
+    CHECK (source_memory_id != target_memory_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_links_source
+    ON memory_links(source_memory_id);
+CREATE INDEX IF NOT EXISTS idx_memory_links_target
+    ON memory_links(target_memory_id);
+
+CREATE TABLE IF NOT EXISTS conversations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role IN ('system', 'user', 'assistant', 'tool')),
+    content TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+    metadata_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS idx_conversations_session
+    ON conversations(session_id, id);
+
+CREATE TABLE IF NOT EXISTS schema_metadata (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+"""
+
+FTS_SQL = """
+CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+    content, memory_type, content='memories', content_rowid='id'
+);
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_insert AFTER INSERT ON memories BEGIN
+    INSERT INTO memories_fts(rowid, content, memory_type)
+    VALUES (new.id, new.content, new.memory_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_delete AFTER DELETE ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, memory_type)
+    VALUES ('delete', old.id, old.content, old.memory_type);
+END;
+
+CREATE TRIGGER IF NOT EXISTS memories_fts_update
+AFTER UPDATE OF content, memory_type ON memories BEGIN
+    INSERT INTO memories_fts(memories_fts, rowid, content, memory_type)
+    VALUES ('delete', old.id, old.content, old.memory_type);
+    INSERT INTO memories_fts(rowid, content, memory_type)
+    VALUES (new.id, new.content, new.memory_type);
+END;
+"""
+
+
+def initialize_schema(connection: sqlite3.Connection) -> None:
+    """Create or upgrade the initial database schema."""
+    connection.execute("PRAGMA foreign_keys = ON")
+    connection.executescript(SCHEMA_SQL)
+
+
+    connection.executescript("""
+    CREATE TABLE IF NOT EXISTS knowledge_records (
+        id TEXT PRIMARY KEY,
+        content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+        knowledge_type TEXT NOT NULL,
+        provenance_json TEXT NOT NULL DEFAULT '[]',
+        confidence REAL CHECK (
+            confidence IS NULL OR confidence BETWEEN 0.0 AND 1.0
+        ),
+        confidence_level TEXT NOT NULL DEFAULT 'unknown',
+        verification TEXT NOT NULL DEFAULT 'unverified',
+        importance INTEGER NOT NULL DEFAULT 3
+            CHECK (importance BETWEEN 1 AND 5),
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        relevant_from TEXT,
+        relevant_until TEXT,
+        revision INTEGER NOT NULL DEFAULT 1 CHECK (revision >= 1),
+        evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+        tags_json TEXT NOT NULL DEFAULT '[]',
+        metadata_json TEXT NOT NULL DEFAULT '{}'
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_records_type
+        ON knowledge_records(knowledge_type);
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_records_updated
+        ON knowledge_records(updated_at);
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_records_verification
+        ON knowledge_records(verification);
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_records_importance
+        ON knowledge_records(importance);
+    """)
+
+    connection.executescript("""
+    CREATE TABLE IF NOT EXISTS knowledge_relationships (
+        id TEXT PRIMARY KEY,
+        source_id TEXT NOT NULL,
+        target_id TEXT NOT NULL,
+        relationship_type TEXT NOT NULL,
+        provenance_json TEXT NOT NULL,
+        confidence REAL CHECK (
+            confidence IS NULL OR confidence BETWEEN 0.0 AND 1.0
+        ),
+        created_at TEXT NOT NULL,
+        evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+        metadata_json TEXT NOT NULL DEFAULT '{}',
+        CHECK (source_id != target_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_relationships_source
+        ON knowledge_relationships(source_id);
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_relationships_target
+        ON knowledge_relationships(target_id);
+
+    CREATE INDEX IF NOT EXISTS idx_knowledge_relationships_type
+        ON knowledge_relationships(relationship_type);
+    """)
+
+    columns = {
+        row["name"]
+        for row in connection.execute("PRAGMA table_info(memories)")
+    }
+    if "memory_type" not in columns:
+        connection.execute(
+            "ALTER TABLE memories ADD COLUMN memory_type TEXT NOT NULL DEFAULT 'fact'"
+        )
+
+    connection.executescript(FTS_SQL)
+    connection.execute(
+        """
+        INSERT INTO schema_metadata (key, value)
+        VALUES ('schema_version', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """,
+        (str(SCHEMA_VERSION),),
+    )
+    # Enforce knowledge relationship integrity at the database boundary.
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS eden_relationship_endpoint_insert
+        BEFORE INSERT ON knowledge_relationships
+        WHEN NOT EXISTS (
+            SELECT 1 FROM knowledge_records WHERE id = NEW.source_id
+        ) OR NOT EXISTS (
+            SELECT 1 FROM knowledge_records WHERE id = NEW.target_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'relationship endpoints must exist');
+        END
+    """)
+
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS eden_relationship_endpoint_update
+        BEFORE UPDATE OF source_id, target_id ON knowledge_relationships
+        WHEN NOT EXISTS (
+            SELECT 1 FROM knowledge_records WHERE id = NEW.source_id
+        ) OR NOT EXISTS (
+            SELECT 1 FROM knowledge_records WHERE id = NEW.target_id
+        )
+        BEGIN
+            SELECT RAISE(ABORT, 'relationship endpoints must exist');
+        END
+    """)
+
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS eden_knowledge_endpoint_delete
+        BEFORE DELETE ON knowledge_records
+        WHEN EXISTS (
+            SELECT 1 FROM knowledge_relationships
+            WHERE source_id = OLD.id OR target_id = OLD.id
+        )
+        BEGIN
+            SELECT RAISE(
+                ABORT,
+                'cannot delete a knowledge record with relationships'
+            );
+        END
+    """)
+
+    from eden.history.revisions import ensure_revision_schema
+    ensure_revision_schema(connection)
+    connection.commit()
+
+
+def initialize(connection: sqlite3.Connection) -> None:
+    """Public compatibility entry point for schema initialization."""
+    initialize_schema(connection)
